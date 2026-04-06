@@ -1,7 +1,9 @@
 // Vercel API - 定位服务（常驻模式）
 // 用户打开页面后位置实时更新，小豆随时来取
+// 支持小豆主动触发刷新
 
 const locationStore = new Map();
+const commandStore = new Map(); // IP -> { cmd, timestamp }
 
 function getClientIP(req) {
   const forwarded = req.headers['x-forwarded-for'];
@@ -12,6 +14,8 @@ function getClientIP(req) {
 module.exports = (req, res) => {
   const ip = getClientIP(req);
   const url = req.url.split('?')[0];
+  
+  // ==================== 用户端 API ====================
   
   // POST /api/location - 用户上传位置
   if (req.method === 'POST' && url === '/api/location') {
@@ -53,6 +57,23 @@ module.exports = (req, res) => {
     return;
   }
   
+  // GET /api/command - 页面轮询获取命令
+  if (req.method === 'GET' && url === '/api/command') {
+    const cmd = commandStore.get(ip);
+    
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    // 返回命令并清除（一次性）
+    if (cmd) {
+      commandStore.delete(ip);
+      res.end(JSON.stringify(cmd));
+    } else {
+      res.end(JSON.stringify({ cmd: null }));
+    }
+    return;
+  }
+  
   // GET /api/status - 获取当前状态
   if (req.method === 'GET' && url === '/api/status') {
     const location = locationStore.get(ip);
@@ -62,9 +83,54 @@ module.exports = (req, res) => {
     
     res.end(JSON.stringify({
       online: !!location,
-      lastUpdate: location?.timestamp || null,
-      latency: Date.now() - new Date(location?.timestamp).getTime() + 'ms'
+      lastUpdate: location?.timestamp || null
     }));
+    return;
+  }
+  
+  // ==================== 小豆端 API ====================
+  
+  // POST /api/refresh - 小豆主动刷新用户位置
+  if (req.method === 'POST' && url === '/api/refresh') {
+    try {
+      const body = JSON.parse(req.body || '{}');
+      const targetIP = body.ip;
+      
+      if (targetIP) {
+        commandStore.set(targetIP, { 
+          cmd: 'refresh', 
+          timestamp: new Date().toISOString() 
+        });
+      } else {
+        // 如果没有指定IP，设置全局刷新（下次轮询时生效）
+        // 页面会检查所有IP，但这里简化处理
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ 
+          success: false, 
+          message: '需要指定用户IP' 
+        }));
+        return;
+      }
+      
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ 
+        success: true, 
+        message: `已向 ${targetIP} 发送刷新指令` 
+      }));
+      return;
+    } catch (e) {
+      res.statusCode = 400;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ success: false }));
+      return;
+    }
+  }
+  
+  // GET /api/my-ip - 获取自己的IP
+  if (req.method === 'GET' && url === '/api/my-ip') {
+    res.setHeader('Content-Type', 'text/plain');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.end(ip);
     return;
   }
   
@@ -97,7 +163,8 @@ function getHTML() {
         .status.offline { background: #f8d7da; color: #721c24; }
         .status.getting { background: #fff3cd; color: #856404; }
         .status.online { background: #d4edda; color: #155724; }
-        .status.error { background: #f8d7da; color: #721c24; }
+        .status.refreshing { background: #cce5ff; color: #004085; animation: pulse 1s infinite; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
         .location-box { background: #f8f9fa; border-radius: 10px; padding: 20px; margin: 20px 0; display: none; }
         .location-box.show { display: block; }
         .coord { font-family: monospace; font-size: 16px; color: #333; margin: 8px 0; }
@@ -107,6 +174,8 @@ function getHTML() {
         .heart.beating { animation: beat 1s infinite; }
         @keyframes beat { 0%,100% { transform: scale(1); } 50% { transform: scale(1.2); } }
         .footer { margin-top: 30px; font-size: 12px; color: #999; }
+        .refresh-notice { display: none; color: #004085; font-size: 14px; margin-top: 10px; }
+        .refresh-notice.show { display: block; }
     </style>
 </head>
 <body>
@@ -122,6 +191,8 @@ function getHTML() {
             <div class="info">精度: ±<span id="acc">-</span>米</div>
         </div>
         
+        <div id="refreshNotice" class="refresh-notice">🔄 小豆正在请求位置...</div>
+        
         <div id="heartbeat" class="heartbeat">
             <span class="heart" id="heartIcon">♥</span>
             <span id="heartbeatText">连接中...</span>
@@ -133,9 +204,11 @@ function getHTML() {
     <script>
         let loc = null;
         let lastUpload = null;
-        let uploadInterval = null;
+        let heartbeatInterval = null;
+        let commandInterval = null;
         
         const HEARTBEAT_INTERVAL = 900000; // 15分钟刷新一次位置
+        const COMMAND_CHECK_INTERVAL = 5000; // 每5秒检查一次命令
         
         function updateStatus(text, className) {
             document.getElementById('status').textContent = text;
@@ -145,36 +218,35 @@ function getHTML() {
         function getLocation() {
             if (!navigator.geolocation) {
                 updateStatus('浏览器不支持定位', 'error');
-                return;
+                return Promise.reject('不支持');
             }
             
-            navigator.geolocation.getCurrentPosition((p) => {
-                loc = p.coords;
-                document.getElementById('lat').textContent = loc.latitude.toFixed(6);
-                document.getElementById('lng').textContent = loc.longitude.toFixed(6);
-                document.getElementById('acc').textContent = Math.round(loc.accuracy);
-                
-                updateStatus('✓ 定位已同步', 'online');
-                document.getElementById('locationBox').className = 'location-box show';
-                
-                // 立即上传一次
-                uploadLocation();
-                
-                // 开始定时上传
-                startHeartbeat();
-                
-            }, (e) => {
-                let msg = '定位失败';
-                if (e.code === 1) msg = '请允许定位权限';
-                else if (e.code === 2) msg = '定位服务不可用';
-                updateStatus(msg, 'error');
-            }, { timeout: 10000 });
+            return new Promise((resolve, reject) => {
+                updateStatus('获取中...', 'getting');
+                navigator.geolocation.getCurrentPosition((p) => {
+                    loc = p.coords;
+                    document.getElementById('lat').textContent = loc.latitude.toFixed(6);
+                    document.getElementById('lng').textContent = loc.longitude.toFixed(6);
+                    document.getElementById('acc').textContent = Math.round(loc.accuracy);
+                    
+                    updateStatus('✓ 定位已同步', 'online');
+                    document.getElementById('locationBox').className = 'location-box show';
+                    
+                    uploadLocation().then(() => resolve()).catch(() => resolve());
+                }, (e) => {
+                    let msg = '定位失败';
+                    if (e.code === 1) msg = '请允许定位权限';
+                    else if (e.code === 2) msg = '定位服务不可用';
+                    updateStatus(msg, 'error');
+                    reject(msg);
+                }, { timeout: 10000 });
+            });
         }
         
         function uploadLocation() {
-            if (!loc) return;
+            if (!loc) return Promise.reject('无位置');
             
-            fetch('/api/location', {
+            return fetch('/api/location', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -188,30 +260,40 @@ function getHTML() {
                     document.getElementById('heartbeatText').textContent = 
                         '已同步 ' + lastUpload.toLocaleTimeString('zh-CN');
                 }
+                return data;
+            });
+        }
+        
+        function checkCommand() {
+            fetch('/api/command').then(r => r.json()).then(data => {
+                if (data.cmd === 'refresh') {
+                    console.log('收到刷新指令，立即刷新位置');
+                    document.getElementById('refreshNotice').className = 'refresh-notice show';
+                    updateStatus('🔄 小豆请求位置...', 'refreshing');
+                    getLocation().then(() => {
+                        document.getElementById('refreshNotice').className = 'refresh-notice';
+                    });
+                }
             }).catch(() => {});
         }
         
         function startHeartbeat() {
-            if (uploadInterval) clearInterval(uploadInterval);
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
             
             const heartIcon = document.getElementById('heartIcon');
             heartIcon.classList.add('beating');
             
-            uploadInterval = setInterval(() => {
-                // 刷新GPS位置
-                navigator.geolocation.getCurrentPosition((p) => {
-                    loc = p.coords;
-                    document.getElementById('lat').textContent = loc.latitude.toFixed(6);
-                    document.getElementById('lng').textContent = loc.longitude.toFixed(6);
-                    document.getElementById('acc').textContent = Math.round(loc.accuracy);
-                    
-                    // 上传到服务器
-                    uploadLocation();
-                    
-                }, () => {}, { timeout: 5000 });
+            heartbeatInterval = setInterval(() => {
+                getLocation().catch(() => {});
             }, HEARTBEAT_INTERVAL);
             
             updateStatus('✓ 实时同步中', 'online');
+        }
+        
+        function startCommandCheck() {
+            if (commandInterval) clearInterval(commandInterval);
+            
+            commandInterval = setInterval(checkCommand, COMMAND_CHECK_INTERVAL);
         }
         
         // 页面可见性变化时保持运行
@@ -221,8 +303,17 @@ function getHTML() {
             }
         });
         
-        window.onload = getLocation;
-        window.onunload = () => { if (uploadInterval) clearInterval(uploadInterval); };
+        window.onload = () => {
+            getLocation().then(() => {
+                startHeartbeat();
+                startCommandCheck();
+            });
+        };
+        
+        window.onunload = () => {
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            if (commandInterval) clearInterval(commandInterval);
+        };
     </script>
 </body>
 </html>`;
