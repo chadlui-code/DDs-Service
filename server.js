@@ -1,8 +1,32 @@
 const http = require('http');
 const url = require('url');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
 const locationStore = new Map();
+
+// 生成简短ID
+function generateId() {
+    return crypto.randomBytes(4).toString('hex');
+}
+
+// 根据 Session ID 获取或创建
+function getSessionId(parsedUrl, cookies) {
+    // 1. 检查 URL 参数
+    if (parsedUrl.query.id) return parsedUrl.query.id;
+    
+    // 2. 检查 Cookie
+    const match = cookies.match(/locid=([^;]+)/);
+    if (match) return match[1];
+    
+    // 3. 生成新的
+    return generateId();
+}
+
+// 设置 Cookie
+function setCookie(id) {
+    return `locid=${id}; Path=/; Max-Age=31536000; SameSite=Lax`;
+}
 
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -30,6 +54,7 @@ const HTML = `<!DOCTYPE html>
         .heart.beating { animation: beat 1s infinite; }
         @keyframes beat { 0%,100% { transform: scale(1); } 50% { transform: scale(1.2); } }
         .footer { margin-top: 30px; font-size: 12px; color: #999; }
+        .session { font-size: 12px; color: #999; margin-top: 10px; }
     </style>
 </head>
 <body>
@@ -47,12 +72,36 @@ const HTML = `<!DOCTYPE html>
             <span class="heart" id="heartIcon">♥</span>
             <span id="heartbeatText">连接中...</span>
         </div>
+        <div id="session" class="session">Session: <span id="sessionId">-</span></div>
         <div class="footer">页面保持后台运行即可</div>
     </div>
     <script>
         let loc = null, heartbeatInterval = null;
         const HEARTBEAT_INTERVAL = 900000;
+        let sessionId = null;
+        
+        // 从URL或Cookie获取session ID
+        function getSessionId() {
+            const params = new URLSearchParams(window.location.search);
+            if (params.has('id')) return params.get('id');
+            const match = document.cookie.match(/locid=([^;]+)/);
+            return match ? match[1] : null;
+        }
+        
+        // 保存session ID到URL和Cookie
+        function saveSessionId(id) {
+            sessionId = id;
+            document.getElementById('sessionId').textContent = id;
+            // 写入Cookie
+            document.cookie = 'locid=' + id + '; path=/; max-age=31536000';
+            // 更新URL（不刷新页面）
+            const url = new URL(window.location);
+            url.searchParams.set('id', id);
+            window.history.replaceState({}, '', url);
+        }
+        
         function updateStatus(t, c) { document.getElementById('status').textContent = t; document.getElementById('status').className = 'status ' + c; }
+        
         function getLocation() {
             if (!navigator.geolocation) { updateStatus('浏览器不支持定位', 'offline'); return Promise.reject(); }
             return new Promise((resolve, reject) => {
@@ -73,9 +122,10 @@ const HTML = `<!DOCTYPE html>
                 }, { timeout: 10000 });
             });
         }
+        
         function uploadLocation() {
-            if (!loc) return Promise.reject();
-            return fetch('/api/location', {
+            if (!loc || !sessionId) return Promise.reject();
+            return fetch('/api/location?id=' + sessionId, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ latitude: loc.latitude, longitude: loc.longitude, accuracy: loc.accuracy })
@@ -86,33 +136,47 @@ const HTML = `<!DOCTYPE html>
                 }
             });
         }
+        
         function startHeartbeat() {
             if (heartbeatInterval) clearInterval(heartbeatInterval);
             document.getElementById('heartIcon').classList.add('beating');
             heartbeatInterval = setInterval(() => getLocation().catch(() => {}), HEARTBEAT_INTERVAL);
             updateStatus('✓ 实时同步中', 'online');
         }
+        
+        function init() {
+            // 获取或生成session ID
+            const id = getSessionId();
+            if (id) {
+                saveSessionId(id);
+                // 立即获取位置
+                getLocation().then(() => startHeartbeat());
+            } else {
+                // 获取新ID
+                fetch('/api/new-session').then(r => r.json()).then(d => {
+                    saveSessionId(d.id);
+                    getLocation().then(() => startHeartbeat());
+                });
+            }
+        }
+        
         document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') getLocation(); });
-        window.onload = () => { getLocation().then(() => startHeartbeat()); };
+        window.onload = init;
     </script>
 </body>
 </html>`;
 
-function getClientIP(req) {
-    const forwarded = req.headers['x-forwarded-for'];
-    if (forwarded) return forwarded.split(',')[0].trim();
-    return req.headers['x-real-ip'] || req.headers['x-client-ip'] || 'unknown';
-}
-
 const server = http.createServer((req, res) => {
-    const ip = getClientIP(req);
     const parsedUrl = url.parse(req.url, true);
     const path = parsedUrl.pathname;
+    const sessionId = parsedUrl.query.id;
+    const cookies = req.headers.cookie || '';
 
     // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
 
     if (req.method === 'OPTIONS') {
         res.writeHead(200);
@@ -120,20 +184,31 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // POST /api/location - 用户上传位置
-    if (path === '/api/location' && req.method === 'POST') {
+    // GET /api/new-session - 创建新Session
+    if (path === '/api/new-session' && req.method === 'GET') {
+        const id = generateId();
+        res.writeHead(200, { 
+            'Content-Type': 'application/json',
+            'Set-Cookie': setCookie(id)
+        });
+        res.end(JSON.stringify({ id }));
+        return;
+    }
+
+    // POST /api/location - 用户上传位置（用Session ID）
+    if (path === '/api/location' && req.method === 'POST' && sessionId) {
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
             try {
                 const data = JSON.parse(body);
-                locationStore.set(ip, {
+                locationStore.set(sessionId, {
                     latitude: data.latitude,
                     longitude: data.longitude,
                     accuracy: data.accuracy,
                     timestamp: new Date().toISOString()
                 });
-                console.log(`[位置更新] ${ip} -> ${data.latitude}, ${data.longitude}`);
+                console.log(`[位置更新] ${sessionId} -> ${data.latitude}, ${data.longitude}`);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: true }));
             } catch (e) {
@@ -144,21 +219,33 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // GET /api/location - 获取位置
-    if (path === '/api/location' && req.method === 'GET') {
-        const location = locationStore.get(ip);
+    // GET /api/location - 获取位置（用Session ID）
+    if (path === '/api/location' && req.method === 'GET' && sessionId) {
+        const location = locationStore.get(sessionId);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         if (location) {
-            res.end(JSON.stringify({ success: true, location }));
+            res.end(JSON.stringify({ success: true, location, id: sessionId }));
         } else {
             res.end(JSON.stringify({ success: false, message: '暂无位置' }));
         }
         return;
     }
 
+    // GET /api/all - 获取所有位置（调试用）
+    if (path === '/api/all' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        const all = {};
+        locationStore.forEach((v, k) => all[k] = v);
+        res.end(JSON.stringify({ count: locationStore.size, locations: all }));
+        return;
+    }
+
     // 首页
     if (path === '/' && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.writeHead(200, { 
+            'Content-Type': 'text/html; charset=utf-8',
+            'Set-Cookie': sessionId ? setCookie(sessionId) : ''
+        });
         res.end(HTML);
         return;
     }
