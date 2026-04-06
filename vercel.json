@@ -1,19 +1,10 @@
 {
-  "version": 2,
+  "name": "dds-location",
+  "version": 1,
   "builds": [
-    {
-      "src": "api/index.js",
-      "use": "@vercel/node"
-    }
+    { "src": "server.js", "use": "@vercel/node" }
   ],
   "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "/api/index.js"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/api/index.js"
-    }
+    { "src": "/(.*)", "dest": "/server.js" }
   ]
 }

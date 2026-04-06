@@ -1,0 +1,9 @@
+{
+  "build": {
+    "runtime": "node"
+  },
+  "deploy": {
+    "port": 8080,
+    "dist": "."
+  }
+}

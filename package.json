@@ -1,9 +1,13 @@
 {
-  "name": "dds-service",
+  "name": "dds-location",
   "version": "1.0.0",
   "description": "雷小豆定位服务",
-  "main": "api/index.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node api/index.js"
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
