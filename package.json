@@ -1,0 +1,9 @@
+{
+  "name": "dds-service",
+  "version": "1.0.0",
+  "description": "雷小豆定位服务",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  }
+}
