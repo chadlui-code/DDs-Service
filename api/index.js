@@ -135,7 +135,7 @@ function getHTML() {
         let lastUpload = null;
         let uploadInterval = null;
         
-        const HEARTBEAT_INTERVAL = 30000; // 30秒刷新一次位置
+        const HEARTBEAT_INTERVAL = 900000; // 15分钟刷新一次位置
         
         function updateStatus(text, className) {
             document.getElementById('status').textContent = text;
