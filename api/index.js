@@ -204,10 +204,40 @@ function getHTML() {
     <script>
         let loc = null;
         let lastUpload = null;
-        let heartbeatInterval = null;
+        let watchId = null;
         let commandInterval = null;
+        let lastReported = null; // { lat, lng } 上次上报的位置
+        const HEARTBEAT_INTERVAL = 900000; // 15分钟
         
-        const HEARTBEAT_INTERVAL = 900000; // 15分钟刷新一次位置
+        // 可靠的心跳上报 — sendBeacon + 递归setTimeout
+        // sendBeacon 是浏览器原生后台API，不受后台标签页节流影响
+        function startHeartbeat() {
+            function tick() {
+                if (loc) {
+                    const data = JSON.stringify({
+                        latitude: loc.latitude,
+                        longitude: loc.longitude,
+                        accuracy: loc.accuracy
+                    });
+                    // 优先用sendBeacon（后台可靠），失败降级fetch
+                    if (!navigator.sendBeacon('/api/location', new Blob([data], { type: 'application/json' }))) {
+                        fetch('/api/location', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: data }).catch(() => {});
+                    }
+                }
+                setTimeout(tick, HEARTBEAT_INTERVAL);
+            }
+            setTimeout(tick, HEARTBEAT_INTERVAL);
+        }
+        
+        // 计算两点间距离（Haversine公式），单位：米
+        function distanceMeters(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLon/2)**2;
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+        
         const COMMAND_CHECK_INTERVAL = 5000; // 每5秒检查一次命令
         
         function updateStatus(text, className) {
@@ -232,7 +262,7 @@ function getHTML() {
                     updateStatus('✓ 定位已同步', 'online');
                     document.getElementById('locationBox').className = 'location-box show';
                     
-                    uploadLocation().then(() => resolve()).catch(() => resolve());
+                    uploadLocation().then(() => { lastReported = { lat: loc.latitude, lng: loc.longitude }; resolve(); }).catch(() => resolve());
                 }, (e) => {
                     let msg = '定位失败';
                     if (e.code === 1) msg = '请允许定位权限';
@@ -277,17 +307,37 @@ function getHTML() {
             }).catch(() => {});
         }
         
-        function startHeartbeat() {
-            if (heartbeatInterval) clearInterval(heartbeatInterval);
+        function startWatching() {
+            if (watchId !== null) return;
             
             const heartIcon = document.getElementById('heartIcon');
             heartIcon.classList.add('beating');
             
-            heartbeatInterval = setInterval(() => {
-                getLocation().catch(() => {});
-            }, HEARTBEAT_INTERVAL);
+            updateStatus('✓ 持续监听中', 'online');
             
-            updateStatus('✓ 实时同步中', 'online');
+            watchId = navigator.geolocation.watchPosition((p) => {
+                loc = p.coords;
+                document.getElementById('lat').textContent = loc.latitude.toFixed(6);
+                document.getElementById('lng').textContent = loc.longitude.toFixed(6);
+                document.getElementById('acc').textContent = Math.round(loc.accuracy);
+                
+                updateStatus('✓ 定位已同步', 'online');
+                document.getElementById('locationBox').className = 'location-box show';
+                
+                // 距离上次上报超过1km才上报
+                if (!lastReported || distanceMeters(lastReported.lat, lastReported.lng, loc.latitude, loc.longitude) >= 1000) {
+                    lastReported = { lat: loc.latitude, lng: loc.longitude };
+                    uploadLocation().catch(() => {});
+                }
+            }, (e) => {
+                let msg = '定位失败';
+                if (e.code === 1) msg = '请允许定位权限';
+                else if (e.code === 2) msg = '定位服务不可用';
+                updateStatus(msg, 'error');
+            }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 300000 });
+            
+            // 启动可靠心跳上报
+            startHeartbeat();
         }
         
         function startCommandCheck() {
@@ -305,13 +355,13 @@ function getHTML() {
         
         window.onload = () => {
             getLocation().then(() => {
-                startHeartbeat();
+                startWatching();
                 startCommandCheck();
             });
         };
         
         window.onunload = () => {
-            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            if (watchId !== null) navigator.geolocation.clearWatch(watchId);
             if (commandInterval) clearInterval(commandInterval);
         };
     </script>
